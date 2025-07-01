@@ -5,13 +5,13 @@ import { Suspense } from "react";
 import { ErrorBoundary } from "react-error-boundary";
 
 interface Props {
-  params: {
+  params: Promise<{
     projectId: string;
-  };
+  }>;
 }
 
 const ProjectPage = async ({ params }: Props) => {
-  const { projectId } = params;
+  const { projectId } = await params;
 
   const queryClient = getQueryClient();
   void queryClient.prefetchQuery(
