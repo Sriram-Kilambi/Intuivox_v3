@@ -1,0 +1,17 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (jm4587ze3gbkdjerly8j) or template name (intuivox-nextjs-test-2) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox("intuivox-nextjs-test-2") # Sync sandbox
+# sandbox = await AsyncSandbox.create("intuivox-nextjs-test-2") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('intuivox-nextjs-test-2')
+
+team_id = "ca13ee66-3cde-4d5b-9c5d-82d57828acd7"
+start_cmd = "/compile_page.sh"
+dockerfile = "e2b.Dockerfile"
+template_name = "intuivox-nextjs-test-2"
+template_id = "jm4587ze3gbkdjerly8j"
