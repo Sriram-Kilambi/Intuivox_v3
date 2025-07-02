@@ -84,7 +84,7 @@ export const ProjectView = ({ projectId }: Props) => {
                   </Button>
                 )}
                 {hasProAccess && (
-                  <span className="flex flex-row gap-2 text-yellow-600 font-semibold">
+                  <span className="flex flex-row gap-2 text-yellow-600 font-semibold px-2">
                     <CrownIcon /> Pro
                   </span>
                 )}

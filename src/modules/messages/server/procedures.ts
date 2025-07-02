@@ -4,6 +4,7 @@ import { consumeCredits } from "@/lib/usage";
 import { protectedProcedure, createTRPCRouter } from "@/trpc/init";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
+import { USER_RESPONSE_EVENT } from "@/inngest/events";
 
 export const messagesRouter = createTRPCRouter({
   getMany: protectedProcedure
@@ -18,14 +19,14 @@ export const messagesRouter = createTRPCRouter({
           projectId: input.projectId,
           project: {
             userId: ctx.auth.userId,
-          }
+          },
         },
         orderBy: {
           updatedAt: "asc",
         },
         include: {
           fragment: true,
-        }
+        },
       });
 
       return messages;
@@ -61,13 +62,13 @@ export const messagesRouter = createTRPCRouter({
         if (error instanceof Error) {
           throw new TRPCError({
             code: "BAD_REQUEST",
-            message: "Something went wrong"
-          })
+            message: "Something went wrong",
+          });
         } else {
           throw new TRPCError({
             code: "TOO_MANY_REQUESTS",
-            message: "You have run out of credits"
-          })
+            message: "You have run out of credits",
+          });
         }
       }
 
@@ -89,5 +90,98 @@ export const messagesRouter = createTRPCRouter({
       });
 
       return createdMessage;
+    }),
+  respondToQuestion: protectedProcedure
+    .input(
+      z.object({
+        response: z
+          .string()
+          .min(1, { message: "Response is required" })
+          .max(10000, { message: "Response is too long" }),
+        projectId: z.string().min(1, { message: "Project ID is required" }),
+        questionId: z.string().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const existingProject = await prisma.project.findUnique({
+        where: {
+          id: input.projectId,
+          userId: ctx.auth.userId,
+        },
+      });
+
+      if (!existingProject) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Project not found",
+        });
+      }
+
+      // Get the question message - either by specific ID or the last one
+      const questionMessage = input.questionId
+        ? await prisma.message.findFirst({
+            where: {
+              id: input.questionId,
+              projectId: input.projectId,
+              role: "ASSISTANT",
+              type: "QUESTION",
+            },
+          })
+        : await prisma.message.findFirst({
+            where: {
+              projectId: input.projectId,
+              role: "ASSISTANT",
+              type: "QUESTION",
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+          });
+
+      if (!questionMessage) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "No question to respond to",
+        });
+      }
+
+      // Create a user message with the response
+      const userMessage = await prisma.message.create({
+        data: {
+          projectId: input.projectId,
+          content: input.response,
+          role: "USER",
+          type: "RESULT",
+          metadata: {
+            respondingTo: questionMessage.id,
+            questionContent: questionMessage.content,
+            questionMetadata: questionMessage.metadata || {},
+          },
+        },
+      });
+
+      console.log(
+        `Sending user response event for question: ${questionMessage.content.substring(
+          0,
+          30
+        )}...`
+      );
+
+      // Send the user response event to Inngest with full context
+      await inngest.send({
+        name: USER_RESPONSE_EVENT,
+        data: {
+          projectId: input.projectId,
+          response: input.response,
+          questionId: questionMessage.id,
+          questionContent: questionMessage.content,
+          questionMetadata: questionMessage.metadata || {},
+        },
+        user: {
+          userId: ctx.auth.userId,
+        },
+      });
+
+      return userMessage;
     }),
 });

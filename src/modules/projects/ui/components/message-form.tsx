@@ -4,7 +4,12 @@ import TextareaAutosize from "react-textarea-autosize";
 import { useState } from "react";
 import { z } from "zod";
 import { toast } from "sonner";
-import { ArrowUpIcon, Loader2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  Loader2Icon,
+  MessageSquareIcon,
+  ReplyIcon,
+} from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { useTRPC } from "@/trpc/client";
@@ -15,6 +20,8 @@ import { useRouter } from "next/navigation";
 
 interface Props {
   projectId: string;
+  isRespondingToQuestion?: boolean;
+  questionId?: string;
 }
 
 const formSchema = z.object({
@@ -24,12 +31,19 @@ const formSchema = z.object({
     .max(10000, { message: "Value is too long" }),
 });
 
-export const MessageForm = ({ projectId }: Props) => {
+export const MessageForm = ({
+  projectId,
+  isRespondingToQuestion,
+  questionId,
+}: Props) => {
   const [isFocused, setIsFocused] = useState(false);
   const queryClient = useQueryClient();
   const trpc = useTRPC();
   const router = useRouter();
   const { data: usage } = useQuery(trpc.usage.status.queryOptions());
+
+  // Use the prop directly or default to false
+  const isResponding = isRespondingToQuestion || false;
 
   const showUsage = !!usage;
 
@@ -60,20 +74,47 @@ export const MessageForm = ({ projectId }: Props) => {
     })
   );
 
-  const isPending = createMessage.isPending;
+  const respondToQuestion = useMutation(
+    trpc.messages.respondToQuestion.mutationOptions({
+      onSuccess: () => {
+        form.reset();
+        queryClient.invalidateQueries(
+          trpc.messages.getMany.queryOptions({
+            projectId,
+          })
+        );
+      },
+      onError: (error) => {
+        toast.error(error.message);
+      },
+    })
+  );
+
+  const isPending = createMessage.isPending || respondToQuestion.isPending;
   const isButtonDisabled = isPending || !form.formState.isValid;
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
     console.log(values);
-    await createMessage.mutateAsync({
-      value: values.value,
-      projectId,
-    });
+
+    if (isResponding) {
+      // If responding to a question, use respondToQuestion mutation
+      await respondToQuestion.mutateAsync({
+        response: values.value,
+        projectId,
+        questionId: questionId,
+      });
+    } else {
+      // Otherwise, use the normal message creation flow
+      await createMessage.mutateAsync({
+        value: values.value,
+        projectId,
+      });
+    }
   };
 
   return (
     <Form {...form}>
-      {showUsage && (
+      {showUsage && !isResponding && (
         <Usage
           points={usage.remainingPoints}
           msBeforeNext={usage.msBeforeNext}
@@ -84,9 +125,15 @@ export const MessageForm = ({ projectId }: Props) => {
         className={cn(
           "relative border p-4 pt-1 rounded-xl bg-sidebar dark:bg-sidebar transition-all",
           isFocused && "shadow-xs",
-          showUsage && "rounded-t-none"
+          showUsage && !isResponding && "rounded-t-none"
         )}
       >
+        {isResponding && (
+          <div className="flex items-center gap-2 text-xs text-primary py-1">
+            <ReplyIcon className="size-3" />
+            <span>Responding to question</span>
+          </div>
+        )}
         <FormField
           control={form.control}
           name="value"
@@ -99,7 +146,11 @@ export const MessageForm = ({ projectId }: Props) => {
               minRows={2}
               maxRows={8}
               className="pt-4 resize-none border-none w-full outline-none bg-transparent"
-              placeholder="What would you like to build?"
+              placeholder={
+                isResponding
+                  ? "Type your response..."
+                  : "What would you like to build?"
+              }
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                   e.preventDefault();
@@ -125,6 +176,8 @@ export const MessageForm = ({ projectId }: Props) => {
           >
             {isPending ? (
               <Loader2Icon className="size-4 animate-spin" />
+            ) : isResponding ? (
+              <ReplyIcon className="size-4" />
             ) : (
               <ArrowUpIcon />
             )}
