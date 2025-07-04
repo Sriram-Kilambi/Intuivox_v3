@@ -143,7 +143,7 @@ You mainly have to chat with the user to gather two separate pieces of informati
 
 1. Business information:
 - Business name
-- Business description  
+- Business description
 - Type of business - industry and sub-industry
 - Business address
 - Business contact information

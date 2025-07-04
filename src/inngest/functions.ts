@@ -10,7 +10,10 @@ import {
 import { Sandbox } from "@e2b/code-interpreter";
 
 import { inngest } from "./client";
-import { getSandbox, lastAssistantTextMessageContent } from "./utils";
+import {
+  getSandboxWithFallback,
+  lastAssistantTextMessageContent,
+} from "./utils";
 import { z } from "zod";
 import {
   BUSINESS_INFO_GATHERER_PROMPT,
@@ -23,6 +26,7 @@ import { SANDBOX_TIMEOUT } from "./constants";
 
 interface AgentState {
   projectId: string;
+  sandboxId: string;
   businessInfo: {
     businessName: string;
     businessDescription: string;
@@ -113,6 +117,7 @@ export const codeAgentFunction = inngest.createFunction(
     const state = createState<AgentState>(
       {
         projectId: event.data.projectId,
+        sandboxId: sandboxId,
         summary: "",
         files: {},
         businessInfo: {
@@ -197,12 +202,24 @@ export const codeAgentFunction = inngest.createFunction(
           parameters: z.object({
             command: z.string(),
           }),
-          handler: async ({ command }, { step }) => {
+          handler: async ({ command }, { step, network }) => {
             return await step?.run("terminal", async () => {
               const buffers = { stdout: "", stderr: "" };
 
               try {
-                const sandbox = await getSandbox(sandboxId);
+                const currentSandboxId = network.state.data.sandboxId;
+                const currentFiles = network.state.data.files || {};
+
+                const { sandbox, newSandboxId } = await getSandboxWithFallback(
+                  currentSandboxId,
+                  currentFiles
+                );
+
+                // Update sandbox ID in state if a new one was created
+                if (newSandboxId) {
+                  network.state.data.sandboxId = newSandboxId;
+                }
+
                 const result = await sandbox.commands.run(command, {
                   onStdout: (data: string) => {
                     buffers.stdout += data;
@@ -248,7 +265,19 @@ export const codeAgentFunction = inngest.createFunction(
               async () => {
                 try {
                   const updatedFiles = network.state.data.files || {};
-                  const sandbox = await getSandbox(sandboxId);
+                  const currentSandboxId = network.state.data.sandboxId;
+
+                  const { sandbox, newSandboxId } =
+                    await getSandboxWithFallback(
+                      currentSandboxId,
+                      updatedFiles
+                    );
+
+                  // Update sandbox ID in state if a new one was created
+                  if (newSandboxId) {
+                    network.state.data.sandboxId = newSandboxId;
+                  }
+
                   for (const file of files) {
                     await sandbox.files.write(file.path, file.content);
                     updatedFiles[file.path] = file.content;
@@ -270,10 +299,22 @@ export const codeAgentFunction = inngest.createFunction(
           parameters: z.object({
             files: z.array(z.string()),
           }),
-          handler: async ({ files }, { step }) => {
+          handler: async ({ files }, { step, network }) => {
             return await step?.run("readFiles", async () => {
               try {
-                const sandbox = await getSandbox(sandboxId);
+                const currentSandboxId = network.state.data.sandboxId;
+                const currentFiles = network.state.data.files || {};
+
+                const { sandbox, newSandboxId } = await getSandboxWithFallback(
+                  currentSandboxId,
+                  currentFiles
+                );
+
+                // Update sandbox ID in state if a new one was created
+                if (newSandboxId) {
+                  network.state.data.sandboxId = newSandboxId;
+                }
+
                 const contents = [];
                 for (const file of files) {
                   const content = await sandbox.files.read(file);
@@ -395,9 +436,23 @@ export const codeAgentFunction = inngest.createFunction(
       Object.keys(result.state.data.files || {}).length === 0;
 
     const sandboxUrl = await step.run("get-sandbox-url", async () => {
-      const sandbox = await getSandbox(sandboxId);
+      const currentSandboxId = result.state.data.sandboxId;
+      const currentFiles = result.state.data.files || {};
+
+      const { sandbox, newSandboxId } = await getSandboxWithFallback(
+        currentSandboxId,
+        currentFiles
+      );
+
+      // If a new sandbox was created, we need to save this information
+      // but we can't update the result state here, so we'll handle it in save-result
+      const finalSandboxId = newSandboxId || currentSandboxId;
+
       const host = sandbox.getHost(3000);
-      return `https://${host}`;
+      return {
+        url: `https://${host}`,
+        finalSandboxId: finalSandboxId,
+      };
     });
 
     await step.run("save-result", async () => {
@@ -420,7 +475,7 @@ export const codeAgentFunction = inngest.createFunction(
           type: "RESULT",
           fragment: {
             create: {
-              sandboxUrl: sandboxUrl,
+              sandboxUrl: sandboxUrl.url,
               title: generateFragmentTitle(),
               files: result.state.data.files,
             },
@@ -430,7 +485,7 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     return {
-      url: sandboxUrl,
+      url: sandboxUrl.url,
       title: "Fragment",
       files: result.state.data.files,
       summary: result.state.data.summary,
