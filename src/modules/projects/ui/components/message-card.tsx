@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { ChevronRightIcon, Code2Icon } from "lucide-react";
 import Image from "next/image";
+import { AgentQuestionCard } from "./agent-question-card";
 
 interface MessageCardProps {
   content: string;
@@ -13,6 +14,7 @@ interface MessageCardProps {
   isActiveFragment: boolean;
   onFragmentClick: (fragment: Fragment) => void;
   type: MessageType;
+  projectId: string;
 }
 
 interface UserMessageProps {
@@ -122,7 +124,19 @@ export const MessageCard = ({
   isActiveFragment,
   onFragmentClick,
   type,
+  projectId,
 }: MessageCardProps) => {
+  // Handle agent questions differently
+  if (role === "ASSISTANT" && type === "AGENT_QUESTION") {
+    return (
+      <AgentQuestionCard
+        content={content}
+        createdAt={createdAt}
+        projectId={projectId}
+      />
+    );
+  }
+
   if (role === "ASSISTANT") {
     return (
       <AssistantMessage

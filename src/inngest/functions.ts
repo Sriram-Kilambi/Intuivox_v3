@@ -12,16 +12,66 @@ import { Sandbox } from "@e2b/code-interpreter";
 import { inngest } from "./client";
 import { getSandbox, lastAssistantTextMessageContent } from "./utils";
 import { z } from "zod";
-import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from "@/prompt";
+import {
+  BUSINESS_INFO_GATHERER_PROMPT,
+  FRAGMENT_TITLE_PROMPT,
+  PROMPT,
+  RESPONSE_PROMPT,
+} from "@/prompt";
 import { prisma } from "@/lib/db";
 import { SANDBOX_TIMEOUT } from "./constants";
 
 interface AgentState {
+  projectId: string;
+  businessInfo: {
+    businessName: string;
+    businessDescription: string;
+    businessIndustry: string;
+    businessSubIndustry: string;
+    businessAddress: string;
+    businessContactInfo: string;
+  };
   summary: string;
   files: {
     [path: string]: string;
   };
 }
+
+// Define the tool for use in functions
+export const askUserQuestionTool = createTool({
+  name: "ask_user_question",
+  description: "Ask the user a question",
+  parameters: z.object({
+    question: z.string().describe("The question to ask the user"),
+  }),
+  handler: async ({ question }, { step, network }) => {
+    // Get projectId from the network state
+    const projectId = network?.state?.data?.projectId;
+
+    await step?.sendEvent(
+      {
+        id: "event-user-question",
+      },
+      {
+        name: "app/user-agent-question",
+        data: {
+          question: question,
+          projectId: projectId,
+        },
+      }
+    );
+
+    const userAnswer = await step?.waitForEvent("user.response", {
+      event: "app/user-agent-response",
+      timeout: "4h",
+    });
+
+    return {
+      answer: userAnswer?.data.answer,
+      responseTime: userAnswer?.data.timestamp,
+    };
+  },
+});
 
 export const codeAgentFunction = inngest.createFunction(
   { id: "code-agent" },
@@ -62,13 +112,72 @@ export const codeAgentFunction = inngest.createFunction(
 
     const state = createState<AgentState>(
       {
+        projectId: event.data.projectId,
         summary: "",
         files: {},
+        businessInfo: {
+          businessName: "",
+          businessDescription: "",
+          businessIndustry: "",
+          businessSubIndustry: "",
+          businessAddress: "",
+          businessContactInfo: "",
+        },
       },
       {
         messages: previousMessages,
       }
     );
+
+    const businessInfoGathererAgent = createAgent<AgentState>({
+      name: "business-info-gatherer-agent",
+      description: "An expert business info gatherer agent",
+      system: BUSINESS_INFO_GATHERER_PROMPT,
+      model: openai({
+        model: "gpt-4o",
+      }),
+      tools: [askUserQuestionTool],
+      lifecycle: {
+        onResponse: async ({ result, network }) => {
+          const lastAssistantMessageText =
+            lastAssistantTextMessageContent(result);
+
+          if (lastAssistantMessageText && network) {
+            // Look for business info in the assistant's response
+            try {
+              // Try to extract business info from structured tags in the response
+              if (lastAssistantMessageText.includes("<business_info>")) {
+                const businessInfoMatch = lastAssistantMessageText.match(
+                  /<business_info>([\s\S]*?)<\/business_info>/
+                );
+                if (businessInfoMatch) {
+                  const businessInfoText = businessInfoMatch[1];
+
+                  // Parse the business info (expecting JSON format)
+                  try {
+                    const parsedBusinessInfo = JSON.parse(businessInfoText);
+
+                    // Update the state with collected business information
+                    network.state.data.businessInfo = {
+                      ...network.state.data.businessInfo,
+                      ...parsedBusinessInfo,
+                    };
+                  } catch {
+                    console.log(
+                      "Could not parse business info as JSON, skipping..."
+                    );
+                  }
+                }
+              }
+            } catch (error) {
+              console.log("Error processing business info:", error);
+            }
+          }
+
+          return result;
+        },
+      },
+    });
 
     // Create a new agent with a system prompt (you can add optional tools, too)
     const codeAgent = createAgent<AgentState>({
@@ -199,15 +308,32 @@ export const codeAgentFunction = inngest.createFunction(
 
     const network = createNetwork<AgentState>({
       name: "coding-agent-network",
-      agents: [codeAgent],
+      agents: [codeAgent, businessInfoGathererAgent],
       maxIter: 15,
       defaultState: state,
       router: async ({ network }) => {
         const summary = network.state.data.summary;
         if (summary) {
-          return;
+          return; // Stop the network when we have a summary
         }
 
+        const businessInfo = network.state.data.businessInfo;
+
+        // Check if all required business information is collected
+        const isBusinessInfoComplete =
+          businessInfo.businessName &&
+          businessInfo.businessDescription &&
+          businessInfo.businessIndustry &&
+          businessInfo.businessSubIndustry &&
+          businessInfo.businessAddress &&
+          businessInfo.businessContactInfo;
+
+        // If business info is not complete, route to business info gatherer
+        if (!isBusinessInfoComplete) {
+          return businessInfoGathererAgent;
+        }
+
+        // If business info is complete, route to code agent
         return codeAgent;
       },
     });
@@ -308,6 +434,30 @@ export const codeAgentFunction = inngest.createFunction(
       title: "Fragment",
       files: result.state.data.files,
       summary: result.state.data.summary,
+    };
+  }
+);
+
+// Add a function to handle user agent questions
+export const handleUserQuestion = inngest.createFunction(
+  { id: "handle-user-question" },
+  { event: "app/user-agent-question" },
+  async ({ event }) => {
+    console.log("Received user agent question:", event.data.question);
+
+    // Store the agent's question in the database so the frontend can display it
+    await prisma.message.create({
+      data: {
+        projectId: event.data.projectId,
+        content: event.data.question,
+        role: "ASSISTANT",
+        type: "AGENT_QUESTION", // New message type for agent questions
+      },
+    });
+
+    return {
+      success: true,
+      question: event.data.question,
     };
   }
 );

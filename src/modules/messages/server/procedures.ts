@@ -90,4 +90,48 @@ export const messagesRouter = createTRPCRouter({
 
       return createdMessage;
     }),
+  respondToAgent: protectedProcedure
+    .input(
+      z.object({
+        answer: z.string().min(1, { message: "Answer is required" }),
+        projectId: z.string().min(1, { message: "Project ID is required" }),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const existingProject = await prisma.project.findUnique({
+        where: {
+          id: input.projectId,
+          userId: ctx.auth.userId,
+        },
+      });
+
+      if (!existingProject) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Project not found",
+        });
+      }
+
+      // Store the user's response as a message
+      const responseMessage = await prisma.message.create({
+        data: {
+          projectId: input.projectId,
+          content: input.answer,
+          role: "USER",
+          type: "RESULT",
+        },
+      });
+
+      // Send the response back to Inngest
+      await inngest.send({
+        name: "app/user-agent-response",
+        data: {
+          answer: input.answer,
+          projectId: input.projectId,
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      return responseMessage;
+    }),
 });
