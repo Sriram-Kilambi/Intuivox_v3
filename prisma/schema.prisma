@@ -22,6 +22,7 @@ model Project {
   updatedAt DateTime @updatedAt
 
   messages Message[]
+  businessInfo BusinessInfo?
 }
 
 enum MessageRole {
@@ -33,6 +34,7 @@ enum MessageType {
   RESULT
   ERROR
   AGENT_QUESTION
+  SYSTEM_STATE
 }
 
 model Message {
@@ -65,4 +67,21 @@ model Usage {
   key String @id
   points Int
   expire DateTime?
+}
+
+model BusinessInfo {
+  id String @id @default(uuid())
+  projectId String @unique
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  businessName String
+  businessDescription String
+  businessIndustry String
+  businessSubIndustry String
+  businessAddress String
+  businessContactInfo String
+  isComplete Boolean @default(false)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

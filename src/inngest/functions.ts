@@ -23,10 +23,12 @@ import {
 } from "@/prompt";
 import { prisma } from "@/lib/db";
 import { SANDBOX_TIMEOUT } from "./constants";
+import { mem0Service } from "@/lib/mem0";
 
 interface AgentState {
   projectId: string;
   sandboxId: string;
+  userId: string; // Add userId for Mem0 integration
   businessInfo: {
     businessName: string;
     businessDescription: string;
@@ -39,7 +41,20 @@ interface AgentState {
   files: {
     [path: string]: string;
   };
+  hasExistingFragments: boolean;
+  previousFiles: {
+    [path: string]: string;
+  };
+  memoryContext?: {
+    hasBusinessInfo: boolean;
+    userIntent: string;
+    relevantContext: string[];
+    shouldSkipBusinessGathering: boolean;
+    previousFragments: number;
+  };
 }
+
+// With Inngest concurrency control, we no longer need complex global state management
 
 // Define the tool for use in functions
 export const askUserQuestionTool = createTool({
@@ -51,83 +66,249 @@ export const askUserQuestionTool = createTool({
   handler: async ({ question }, { step, network }) => {
     // Get projectId from the network state
     const projectId = network?.state?.data?.projectId;
+    const userId = network?.state?.data?.userId;
 
+    if (!projectId || !userId) {
+      throw new Error("Project ID or User ID not found in network state");
+    }
+
+    console.log(`[${projectId}] Question request received: ${question}`);
+
+    // With concurrency control, only one instance per project runs at a time
+    // So we can simplify the question handling significantly
+
+    const questionId = `${projectId}-${userId}-${Date.now()}-${Math.floor(
+      Math.random() * 100000
+    )}`;
+
+    // Send the question event
     await step?.sendEvent(
       {
-        id: "event-user-question",
+        id: `event-user-question-${questionId}`,
       },
       {
         name: "app/user-agent-question",
         data: {
           question: question,
           projectId: projectId,
+          questionId: questionId,
         },
       }
     );
 
-    const userAnswer = await step?.waitForEvent("user.response", {
-      event: "app/user-agent-response",
-      timeout: "4h",
-    });
+    console.log(
+      `[${projectId}] Question sent, waiting for response (ID: ${questionId})...`
+    );
 
-    return {
-      answer: userAnswer?.data.answer,
-      responseTime: userAnswer?.data.timestamp,
-    };
+    try {
+      const userAnswer = await step?.waitForEvent(
+        `user-response-${questionId}`,
+        {
+          event: "app/user-agent-response",
+          if: `event.data.projectId == "${projectId}"`,
+          timeout: "5h",
+        }
+      );
+
+      console.log(
+        `[${projectId}] Received user answer:`,
+        userAnswer?.data.answer
+      );
+
+      return {
+        answer: userAnswer?.data.answer,
+        responseTime: userAnswer?.data.timestamp,
+      };
+    } catch (error) {
+      console.error(`[${projectId}] Error waiting for user response:`, error);
+      throw error;
+    }
   },
 });
 
 export const codeAgentFunction = inngest.createFunction(
-  { id: "code-agent" },
+  {
+    id: "code-agent",
+    // Ensure only one network instance runs per project at a time
+    concurrency: [
+      {
+        key: "event.data.projectId",
+        limit: 1,
+      },
+    ],
+  },
   { event: "code-agent/run" },
   async ({ event, step }) => {
+    // DEBUG: Log function invocation
+    console.log(
+      `[DEBUG] codeAgentFunction called with projectId: ${
+        event.data.projectId
+      }, value: ${event.data.value.substring(0, 50)}...`
+    );
+    console.log(`[DEBUG] Event data:`, JSON.stringify(event.data, null, 2));
+    console.log(`[DEBUG] Concurrency key would be: "${event.data.projectId}"`);
+    console.log(`[DEBUG] Type of projectId: ${typeof event.data.projectId}`);
+
+    // Add database-level lock to prevent multiple instances
+    const lockKey = `agent_running_${event.data.projectId}`;
+    const lockAcquired = await step.run("acquire-lock", async () => {
+      try {
+        // Try to create a lock record in the database
+        await prisma.message.create({
+          data: {
+            projectId: event.data.projectId,
+            content: `LOCK:${lockKey}`,
+            role: "ASSISTANT",
+            type: "SYSTEM_STATE",
+          },
+        });
+        console.log(
+          `[DEBUG] Lock acquired for project ${event.data.projectId}`
+        );
+        return true;
+      } catch {
+        // If lock creation fails, another instance is running
+        console.log(
+          `[DEBUG] Lock NOT acquired for project ${event.data.projectId} - another instance is running`
+        );
+        return false;
+      }
+    });
+
+    if (!lockAcquired) {
+      console.log(
+        `[DEBUG] Exiting - another instance is already running for project ${event.data.projectId}`
+      );
+      return {
+        url: "",
+        title: "Skipped",
+        files: {},
+        summary: "Skipped - another instance running",
+      };
+    }
     const sandboxId = await step.run("get-sandbox-id", async () => {
       const sandbox = await Sandbox.create("intuivox-nextjs-test-2");
       await sandbox.setTimeout(SANDBOX_TIMEOUT); // Keep sandbox alive for 30 mins
       return sandbox.sandboxId;
     });
 
-    const previousMessages = await step.run(
-      "get-previous-messages",
-      async () => {
-        const formattedMessages: Message[] = [];
+    const {
+      previousMessages,
+      existingBusinessInfo,
+      hasExistingFragments,
+      previousFiles,
+      userId,
+      memoryContext,
+    } = await step.run("get-previous-context", async () => {
+      const formattedMessages: Message[] = [];
 
-        const messages = await prisma.message.findMany({
-          where: {
+      // Get recent messages for context
+      const messages = await prisma.message.findMany({
+        where: {
+          projectId: event.data.projectId,
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        take: 10, // Increased to get more context
+      });
+
+      for (const message of messages) {
+        formattedMessages.push({
+          type: "text",
+          role: message.role === "ASSISTANT" ? "assistant" : "user",
+          content: message.content,
+        });
+      }
+
+      // Get existing business info from dedicated table
+      const businessInfoRecord = await prisma.businessInfo.findUnique({
+        where: {
+          projectId: event.data.projectId,
+        },
+      });
+
+      const businessInfo = {
+        businessName: businessInfoRecord?.businessName || "",
+        businessDescription: businessInfoRecord?.businessDescription || "",
+        businessIndustry: businessInfoRecord?.businessIndustry || "",
+        businessSubIndustry: businessInfoRecord?.businessSubIndustry || "",
+        businessAddress: businessInfoRecord?.businessAddress || "",
+        businessContactInfo: businessInfoRecord?.businessContactInfo || "",
+      };
+
+      // Check if we have any existing fragments (meaning business info was collected before)
+      const existingFragmentCount = await prisma.fragment.count({
+        where: {
+          message: {
             projectId: event.data.projectId,
           },
-          orderBy: {
-            createdAt: "desc",
+        },
+      });
+
+      // Get the most recent fragment's files to share with the LLM
+      const mostRecentFragment = await prisma.fragment.findFirst({
+        where: {
+          message: {
+            projectId: event.data.projectId,
           },
-          take: 5,
-        });
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+      });
 
-        for (const message of messages) {
-          formattedMessages.push({
-            type: "text",
-            role: message.role === "ASSISTANT" ? "assistant" : "user",
-            content: message.content,
-          });
-        }
+      const previousFiles =
+        (mostRecentFragment?.files as { [path: string]: string }) || {};
 
-        return formattedMessages.reverse();
+      // Get project to access userId
+      const project = await prisma.project.findUnique({
+        where: { id: event.data.projectId },
+      });
+
+      const userId = project?.userId || "anonymous";
+
+      // Get memory context using Mem0 for intelligent routing
+      let memoryContext = {
+        hasBusinessInfo: false,
+        userIntent: "unknown" as string,
+        relevantContext: [] as string[],
+        shouldSkipBusinessGathering: false,
+        previousFragments: 0,
+      };
+
+      try {
+        memoryContext = await mem0Service.getConversationContext(
+          userId,
+          event.data.projectId,
+          event.data.value
+        );
+        console.log("Memory context loaded:", memoryContext);
+      } catch (error) {
+        console.error("Error loading memory context:", error);
       }
-    );
+
+      return {
+        previousMessages: formattedMessages.reverse(),
+        existingBusinessInfo: businessInfo,
+        hasExistingFragments: existingFragmentCount > 0,
+        previousFiles: previousFiles,
+        userId: userId,
+        memoryContext: memoryContext,
+      };
+    });
 
     const state = createState<AgentState>(
       {
         projectId: event.data.projectId,
         sandboxId: sandboxId,
+        userId: userId, // Add userId for Mem0 integration
         summary: "",
-        files: {},
-        businessInfo: {
-          businessName: "",
-          businessDescription: "",
-          businessIndustry: "",
-          businessSubIndustry: "",
-          businessAddress: "",
-          businessContactInfo: "",
-        },
+        files: previousFiles, // Start with previous files as the base
+        businessInfo: existingBusinessInfo, // Use existing business info from previous conversations
+        hasExistingFragments: hasExistingFragments, // Track if we've created fragments before
+        previousFiles: previousFiles, // Include previous files for context
+        memoryContext: memoryContext, // Add memory context from Mem0
       },
       {
         messages: previousMessages,
@@ -137,7 +318,15 @@ export const codeAgentFunction = inngest.createFunction(
     const businessInfoGathererAgent = createAgent<AgentState>({
       name: "business-info-gatherer-agent",
       description: "An expert business info gatherer agent",
-      system: BUSINESS_INFO_GATHERER_PROMPT,
+      system: `${BUSINESS_INFO_GATHERER_PROMPT}
+
+MEMORY CONTEXT:
+You have access to memory context that may contain information about previous conversations with this user.
+Memory context: ${JSON.stringify(memoryContext)}
+
+If the memory context suggests that business information has already been collected, or if the user is asking for incremental changes to an existing website, you should be more selective about what questions to ask.
+
+Use the relevant context from memory to avoid asking questions that have already been answered in previous conversations.`,
       model: openai({
         model: "gpt-4o",
       }),
@@ -167,6 +356,80 @@ export const codeAgentFunction = inngest.createFunction(
                       ...network.state.data.businessInfo,
                       ...parsedBusinessInfo,
                     };
+
+                    // Save business info to database
+                    const projectId = network.state.data.projectId;
+
+                    // Check if all required fields are present
+                    const isComplete = !!(
+                      parsedBusinessInfo.businessName &&
+                      parsedBusinessInfo.businessDescription &&
+                      parsedBusinessInfo.businessIndustry &&
+                      parsedBusinessInfo.businessSubIndustry &&
+                      parsedBusinessInfo.businessAddress &&
+                      parsedBusinessInfo.businessContactInfo
+                    );
+
+                    // Upsert business info
+                    await prisma.businessInfo.upsert({
+                      where: {
+                        projectId: projectId,
+                      },
+                      update: {
+                        businessName: parsedBusinessInfo.businessName || "",
+                        businessDescription:
+                          parsedBusinessInfo.businessDescription || "",
+                        businessIndustry:
+                          parsedBusinessInfo.businessIndustry || "",
+                        businessSubIndustry:
+                          parsedBusinessInfo.businessSubIndustry || "",
+                        businessAddress:
+                          parsedBusinessInfo.businessAddress || "",
+                        businessContactInfo:
+                          parsedBusinessInfo.businessContactInfo || "",
+                        isComplete,
+                      },
+                      create: {
+                        projectId: projectId,
+                        businessName: parsedBusinessInfo.businessName || "",
+                        businessDescription:
+                          parsedBusinessInfo.businessDescription || "",
+                        businessIndustry:
+                          parsedBusinessInfo.businessIndustry || "",
+                        businessSubIndustry:
+                          parsedBusinessInfo.businessSubIndustry || "",
+                        businessAddress:
+                          parsedBusinessInfo.businessAddress || "",
+                        businessContactInfo:
+                          parsedBusinessInfo.businessContactInfo || "",
+                        isComplete,
+                      },
+                    });
+
+                    console.log(
+                      "Business info saved to database:",
+                      parsedBusinessInfo
+                    );
+
+                    // Store business info completion in Mem0 for future reference
+                    if (isComplete && network.state.data.userId) {
+                      try {
+                        await mem0Service.storeBusinessInfoCompletion(
+                          network.state.data.userId,
+                          projectId,
+                          {
+                            ...parsedBusinessInfo,
+                            isComplete,
+                          }
+                        );
+                        console.log("Business info stored in Mem0 memory");
+                      } catch (error) {
+                        console.error(
+                          "Error storing business info in Mem0:",
+                          error
+                        );
+                      }
+                    }
                   } catch {
                     console.log(
                       "Could not parse business info as JSON, skipping..."
@@ -203,7 +466,10 @@ export const codeAgentFunction = inngest.createFunction(
             command: z.string(),
           }),
           handler: async ({ command }, { step, network }) => {
-            return await step?.run("terminal", async () => {
+            const terminalUniqueId = `${
+              network.state.data.projectId
+            }-terminal-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+            return await step?.run(terminalUniqueId, async () => {
               const buffers = { stdout: "", stderr: "" };
 
               try {
@@ -260,34 +526,33 @@ export const codeAgentFunction = inngest.createFunction(
              * }
              */
 
-            const newFiles = await step?.run(
-              "createOrUpdateFiles",
-              async () => {
-                try {
-                  const updatedFiles = network.state.data.files || {};
-                  const currentSandboxId = network.state.data.sandboxId;
+            const filesUniqueId = `${
+              network.state.data.projectId
+            }-files-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+            const newFiles = await step?.run(filesUniqueId, async () => {
+              try {
+                const updatedFiles = network.state.data.files || {};
+                const currentSandboxId = network.state.data.sandboxId;
 
-                  const { sandbox, newSandboxId } =
-                    await getSandboxWithFallback(
-                      currentSandboxId,
-                      updatedFiles
-                    );
+                const { sandbox, newSandboxId } = await getSandboxWithFallback(
+                  currentSandboxId,
+                  updatedFiles
+                );
 
-                  // Update sandbox ID in state if a new one was created
-                  if (newSandboxId) {
-                    network.state.data.sandboxId = newSandboxId;
-                  }
-
-                  for (const file of files) {
-                    await sandbox.files.write(file.path, file.content);
-                    updatedFiles[file.path] = file.content;
-                  }
-                  return updatedFiles;
-                } catch (e) {
-                  return "Error: " + e;
+                // Update sandbox ID in state if a new one was created
+                if (newSandboxId) {
+                  network.state.data.sandboxId = newSandboxId;
                 }
+
+                for (const file of files) {
+                  await sandbox.files.write(file.path, file.content);
+                  updatedFiles[file.path] = file.content;
+                }
+                return updatedFiles;
+              } catch (e) {
+                return "Error: " + e;
               }
-            );
+            });
             if (typeof newFiles === "object") {
               network.state.data.files = newFiles;
             }
@@ -300,7 +565,10 @@ export const codeAgentFunction = inngest.createFunction(
             files: z.array(z.string()),
           }),
           handler: async ({ files }, { step, network }) => {
-            return await step?.run("readFiles", async () => {
+            const readUniqueId = `${
+              network.state.data.projectId
+            }-read-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+            return await step?.run(readUniqueId, async () => {
               try {
                 const currentSandboxId = network.state.data.sandboxId;
                 const currentFiles = network.state.data.files || {};
@@ -339,6 +607,34 @@ export const codeAgentFunction = inngest.createFunction(
           if (lastAssistantMessageText && network) {
             if (lastAssistantMessageText.includes("<task_summary>")) {
               network.state.data.summary = lastAssistantMessageText;
+
+              // Store successful code generation pattern in memory
+              try {
+                const userId = network.state.data.userId;
+                const projectId = network.state.data.projectId;
+
+                await mem0Service.storeCodePattern(
+                  userId,
+                  projectId,
+                  `Successfully generated code with summary: ${lastAssistantMessageText.substring(
+                    0,
+                    200
+                  )}`,
+                  true
+                );
+
+                // Store general success pattern
+                await mem0Service.storeConversationContext(
+                  userId,
+                  projectId,
+                  "Code generation completed successfully",
+                  "code_generation_success"
+                );
+
+                console.log("Stored successful code generation in memory");
+              } catch (error) {
+                console.error("Error storing code pattern in memory:", error);
+              }
             }
           }
 
@@ -354,27 +650,78 @@ export const codeAgentFunction = inngest.createFunction(
       defaultState: state,
       router: async ({ network }) => {
         const summary = network.state.data.summary;
+        const projectId = network.state.data.projectId;
+
+        console.log(`[${projectId}] Router called - summary: ${!!summary}`);
+
         if (summary) {
+          console.log(`[${projectId}] Network stopping - summary found`);
           return; // Stop the network when we have a summary
         }
 
-        const businessInfo = network.state.data.businessInfo;
+        const memoryContext = network.state.data.memoryContext;
+        const userId = network.state.data.userId;
 
-        // Check if all required business information is collected
-        const isBusinessInfoComplete =
-          businessInfo.businessName &&
-          businessInfo.businessDescription &&
-          businessInfo.businessIndustry &&
-          businessInfo.businessSubIndustry &&
-          businessInfo.businessAddress &&
-          businessInfo.businessContactInfo;
+        // Enhanced routing using Mem0 memory context
+        console.log(
+          `[${projectId}] Router using memory context:`,
+          memoryContext
+        );
 
-        // If business info is not complete, route to business info gatherer
-        if (!isBusinessInfoComplete) {
+        // If memory says we should skip business gathering (e.g., incremental changes)
+        if (memoryContext?.shouldSkipBusinessGathering) {
+          console.log(
+            "Memory context suggests skipping business info gathering - routing to code agent"
+          );
+
+          // Store this interaction in memory
+          try {
+            await mem0Service.storeConversationContext(
+              userId,
+              projectId,
+              "User is making incremental changes, skipped business info gathering",
+              "incremental_change"
+            );
+          } catch (error) {
+            console.error("Error storing conversation context:", error);
+          }
+
+          return codeAgent;
+        }
+
+        // Check business info completeness from database (fallback)
+        const businessInfoRecord = await prisma.businessInfo.findUnique({
+          where: {
+            projectId: projectId,
+          },
+        });
+
+        const isBusinessInfoComplete = businessInfoRecord?.isComplete || false;
+        const hasMemoryBusinessInfo = memoryContext?.hasBusinessInfo || false;
+
+        // Use memory context to make smarter routing decisions
+        const shouldUseCodeAgent =
+          (isBusinessInfoComplete || hasMemoryBusinessInfo) &&
+          (network.state.data.hasExistingFragments ||
+            memoryContext?.userIntent === "incremental_change");
+
+        if (shouldUseCodeAgent) {
+          console.log(
+            "Business info available (database or memory) and user intent understood - routing to code agent"
+          );
+          return codeAgent;
+        }
+
+        // If business info is not complete and memory doesn't suggest otherwise
+        if (!isBusinessInfoComplete && !hasMemoryBusinessInfo) {
+          console.log(
+            "Business info incomplete in both database and memory - routing to business info gatherer"
+          );
           return businessInfoGathererAgent;
         }
 
-        // If business info is complete, route to code agent
+        // Default to code agent for edge cases
+        console.log("Default routing - going to code agent");
         return codeAgent;
       },
     });
@@ -484,6 +831,26 @@ export const codeAgentFunction = inngest.createFunction(
       });
     });
 
+    // Release the lock
+    await step.run("release-lock", async () => {
+      try {
+        await prisma.message.deleteMany({
+          where: {
+            projectId: event.data.projectId,
+            content: `LOCK:${lockKey}`,
+            type: "SYSTEM_STATE",
+          },
+        });
+        console.log(
+          `[DEBUG] Lock released for project ${event.data.projectId}`
+        );
+      } catch {
+        console.log(
+          `[DEBUG] Failed to release lock for project ${event.data.projectId}`
+        );
+      }
+    });
+
     return {
       url: sandboxUrl.url,
       title: "Fragment",
@@ -495,7 +862,16 @@ export const codeAgentFunction = inngest.createFunction(
 
 // Add a function to handle user agent questions
 export const handleUserQuestion = inngest.createFunction(
-  { id: "handle-user-question" },
+  {
+    id: "handle-user-question",
+    // Ensure only one question handler runs per project at a time
+    concurrency: [
+      {
+        key: "event.data.projectId",
+        limit: 1,
+      },
+    ],
+  },
   { event: "app/user-agent-question" },
   async ({ event }) => {
     console.log("Received user agent question:", event.data.question);
