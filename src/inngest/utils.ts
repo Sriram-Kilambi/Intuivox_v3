@@ -18,24 +18,40 @@ export async function getSandboxWithFallback(
     await sandbox.setTimeout(SANDBOX_TIMEOUT);
     return { sandbox };
   } catch (error) {
-    console.log(`Sandbox ${sandboxId} expired or unavailable, creating new one:`, error);
-    
+    console.log(
+      `Sandbox ${sandboxId} expired or unavailable, creating new one:`,
+      error
+    );
+
     // Create new sandbox if the old one is expired
     const newSandbox = await Sandbox.create("intuivox-nextjs-test-2");
     await newSandbox.setTimeout(SANDBOX_TIMEOUT);
-    
+
     // Recreate all files from state
-    for (const [path, content] of Object.entries(files)) {
-      try {
-        await newSandbox.files.write(path, content);
-      } catch (fileError) {
-        console.error(`Failed to recreate file ${path}:`, fileError);
+    const fileCount = Object.keys(files).length;
+    if (fileCount > 0) {
+      console.log(
+        `Restoring ${fileCount} files to new sandbox:`,
+        Object.keys(files)
+      );
+      for (const [path, content] of Object.entries(files)) {
+        try {
+          await newSandbox.files.write(path, content);
+          console.log(`✓ Restored file: ${path}`);
+        } catch (fileError) {
+          console.error(`✗ Failed to restore file ${path}:`, fileError);
+        }
       }
+      console.log(
+        `Completed file restoration for sandbox ${newSandbox.sandboxId}`
+      );
+    } else {
+      console.log("No files to restore - starting with clean sandbox");
     }
-    
-    return { 
-      sandbox: newSandbox, 
-      newSandboxId: newSandbox.sandboxId 
+
+    return {
+      sandbox: newSandbox,
+      newSandboxId: newSandbox.sandboxId,
     };
   }
 }

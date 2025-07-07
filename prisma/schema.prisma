@@ -21,6 +21,10 @@ model Project {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Track the active conversation thread for this project
+  activeThreadId String? @unique
+  activeThread Thread? @relation(fields: [activeThreadId], references: [id], onDelete: SetNull)
+
   messages Message[]
 }
 
@@ -47,6 +51,24 @@ model Message {
 
   projectId String
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // For conversation history (optional)
+  threadId String?
+  thread Thread? @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  agentName String?
+}
+
+model Thread {
+  id String @id @default(uuid())
+  title String
+  userId String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+  
+  // Relation to track which project this is the active thread for
+  activeForProject Project?
 }
 
 model Fragment {

@@ -73,9 +73,34 @@ export const messagesRouter = createTRPCRouter({
         }
       }
 
+      // Get or create the active thread for this project
+      let threadId = existingProject.activeThreadId;
+      
+      if (!threadId) {
+        // Create a new thread if none exists
+        const thread = await prisma.thread.create({
+          data: {
+            userId: ctx.auth.userId,
+            title: input.value.slice(0, 50), // First 50 chars as title
+          },
+        });
+        
+        // Set this thread as the active thread for the project
+        await prisma.project.update({
+          where: { id: existingProject.id },
+          data: { activeThreadId: thread.id },
+        });
+        
+        threadId = thread.id;
+        console.log(`Created new thread ${threadId} for project ${existingProject.id}`);
+      } else {
+        console.log(`Using existing thread ${threadId} for project ${existingProject.id}`);
+      }
+
       const createdMessage = await prisma.message.create({
         data: {
           projectId: existingProject.id,
+          threadId: threadId,
           content: input.value,
           role: "USER",
           type: "RESULT",
@@ -114,10 +139,14 @@ export const messagesRouter = createTRPCRouter({
         });
       }
 
+      // Get the active thread for this project
+      const threadId = existingProject.activeThreadId;
+      
       // Store the user's response as a message
       const responseMessage = await prisma.message.create({
         data: {
           projectId: input.projectId,
+          threadId: threadId,
           content: input.answer,
           role: "USER",
           type: "RESULT",
