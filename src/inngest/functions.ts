@@ -516,3 +516,137 @@ export const handleUserQuestion = inngest.createFunction(
     };
   }
 );
+
+// Railway deployment function
+export const deploymentFunction = inngest.createFunction(
+  { id: "railway-deployment" },
+  { event: "deployment/start" },
+  async ({ event, step }) => {
+    const { deploymentId, fragmentId, userId, customDomain } = event.data;
+
+    try {
+      // Step 1: Update deployment status to CREATING
+      await step.run("update-status-creating", async () => {
+        return prisma.deployment.update({
+          where: { id: deploymentId },
+          data: {
+            status: "CREATING",
+            updatedAt: new Date(),
+          },
+        });
+      });
+
+      // Step 2: Deploy to Railway
+      const railwayDeployment = await step.run(
+        "deploy-to-railway",
+        async () => {
+          const { deployFragmentToRailway } = await import("@/lib/railway");
+          const result = await deployFragmentToRailway(
+            userId,
+            fragmentId,
+            customDomain
+          );
+
+          // Update deployment with Railway IDs
+          await prisma.deployment.update({
+            where: { id: deploymentId },
+            data: {
+              railwayProjectId: result.projectId,
+              railwayServiceId: result.serviceId,
+              railwayDeploymentId: result.deploymentId,
+              deploymentUrl: result.deploymentUrl,
+              status: "BUILDING",
+              updatedAt: new Date(),
+            },
+          });
+
+          return result;
+        }
+      );
+
+      // Step 3: Poll deployment status until complete
+      await step.run("poll-deployment-status", async () => {
+        const { pollDeploymentStatus } = await import("@/lib/railway");
+        const finalStatus = await pollDeploymentStatus(
+          userId,
+          railwayDeployment.deploymentId,
+          async (status) => {
+            // Update deployment status in real-time
+            let deploymentStatus:
+              | "CREATING"
+              | "BUILDING"
+              | "DEPLOYING"
+              | "LIVE"
+              | "FAILED"
+              | "UPDATING" = "BUILDING";
+
+            switch (status.status) {
+              case "QUEUED":
+              case "BUILDING":
+                deploymentStatus = "BUILDING";
+                break;
+              case "DEPLOYING":
+                deploymentStatus = "DEPLOYING";
+                break;
+              case "SUCCESS":
+                deploymentStatus = "LIVE";
+                break;
+              case "FAILED":
+              case "CRASHED":
+                deploymentStatus = "FAILED";
+                break;
+            }
+
+            await prisma.deployment.update({
+              where: { id: deploymentId },
+              data: {
+                status: deploymentStatus,
+                buildLogs: status.buildLogs,
+                updatedAt: new Date(),
+              },
+            });
+          }
+        );
+
+        // Final status update
+        const finalDeploymentStatus =
+          finalStatus.status === "SUCCESS" ? "LIVE" : "FAILED";
+
+        await prisma.deployment.update({
+          where: { id: deploymentId },
+          data: {
+            status: finalDeploymentStatus,
+            buildLogs: finalStatus.buildLogs,
+            errorMessage:
+              finalStatus.status === "FAILED"
+                ? "Deployment failed during build or deploy phase"
+                : null,
+            updatedAt: new Date(),
+          },
+        });
+
+        return finalStatus;
+      });
+
+      return { success: true, deploymentId };
+    } catch (error) {
+      // Update deployment status to FAILED
+      await step.run("update-status-failed", async () => {
+        return prisma.deployment.update({
+          where: { id: deploymentId },
+          data: {
+            status: "FAILED",
+            errorMessage:
+              error instanceof Error
+                ? error.message
+                : "Unknown deployment error",
+            updatedAt: new Date(),
+          },
+        });
+      });
+
+      // Re-throw the error to mark the function as failed
+      throw error;
+    }
+  }
+);

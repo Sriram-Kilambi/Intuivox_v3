@@ -6,6 +6,7 @@ import { Hint } from "@/components/hint";
 import { useTRPC } from "@/trpc/client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { DeployButton } from "./deploy-button";
 
 interface Props {
   data: Fragment;
@@ -215,6 +216,11 @@ export const FragmentWeb = ({ data, projectId }: Props) => {
             <ExternalLinkIcon />
           </Button>
         </Hint>
+
+        <DeployButton
+          fragment={data}
+          disabled={!currentSandboxUrl || sandboxStatus === "loading"}
+        />
       </div>
 
       <div className="flex-1 relative bg-slate-100 dark:bg-slate-900">
@@ -285,7 +291,7 @@ export const FragmentWeb = ({ data, projectId }: Props) => {
 
               <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed mb-4">
                 {regenerateSandbox.isPending
-                  ? "We're creating a new sandbox and restoring your files. This usually takes 10-15 seconds."
+                  ? "We&apos;re creating a new sandbox and restoring your files. This usually takes 10-15 seconds."
                   : "Preparing your development environment..."}
               </p>
 
@@ -333,8 +339,8 @@ export const FragmentWeb = ({ data, projectId }: Props) => {
 
               <p className="text-amber-700 dark:text-amber-300 text-sm leading-relaxed mb-6">
                 Your development environment has expired after 30 minutes of
-                inactivity. Don't worry - your code is safe and will be restored
-                automatically.
+                inactivity. Don&apos;t worry - your code is safe and will be
+                restored automatically.
               </p>
 
               <Button

@@ -59,10 +59,70 @@ model Fragment {
   files Json
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  deployments Deployment[]
 }
 
 model Usage {
   key String @id
   points Int
   expire DateTime?
+}
+
+model UserRailwayConnection {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  accessToken String   // Railway API token (encrypted)
+  teamId      String?  // Railway team ID if applicable
+  email       String   // Railway account email
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  deployments Deployment[]
+
+  @@map("user_railway_connections")
+}
+
+model Deployment {
+  id String @id @default(uuid())
+  
+  // Fragment relationship
+  fragmentId String
+  fragment   Fragment @relation(fields: [fragmentId], references: [id], onDelete: Cascade)
+  
+  // User relationship
+  userId String
+  
+  // Railway deployment info
+  railwayProjectId   String // Railway project ID
+  railwayServiceId   String // Railway service ID  
+  railwayDeploymentId String? // Specific deployment ID
+  
+  // Deployment details
+  deploymentUrl String // Generated Railway URL
+  customDomain  String? // User's custom domain (if provided)
+  
+  // Status tracking
+  status DeploymentStatus @default(CREATING)
+  buildLogs String? // Build output logs
+  errorMessage String? // Error details if failed
+  
+  // Metadata
+  projectName String // Generated project name
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Railway connection
+  railwayConnection UserRailwayConnection @relation(fields: [userId], references: [userId])
+
+  @@map("deployments")
+}
+
+enum DeploymentStatus {
+  CREATING     // Creating Railway project
+  BUILDING     // Building the application
+  DEPLOYING    // Deploying to Railway
+  LIVE         // Successfully deployed and live
+  FAILED       // Deployment failed
+  UPDATING     // Updating existing deployment
 }
