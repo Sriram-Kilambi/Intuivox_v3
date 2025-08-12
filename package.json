@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "echo 'No test framework configured yet. To test the history adapter, run: npx tsx src/inngest/validate-history.ts'",
+    "test:history": "npx tsx src/inngest/validate-history.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {

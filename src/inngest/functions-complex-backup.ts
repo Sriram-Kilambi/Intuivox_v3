@@ -25,6 +25,7 @@ import { prisma } from "@/lib/db";
 import { SANDBOX_TIMEOUT } from "./constants";
 import { intuivoxHistoryAdapter } from "./history-adapter";
 import { 
+  getProjectState, 
   checkExistingBusinessInfo,
   detectProjectPhase,
   isChangeRequest 
@@ -39,13 +40,148 @@ const ENABLE_HISTORY = process.env.ENABLE_AGENTKIT_HISTORY === 'true';
 
 // Global context for router access
 let currentUserInput = '';
+let currentProjectId = '';
 
-// Simple in-memory lock for preventing duplicate executions
-const executionLocks = new Set<string>();
+/**
+ * Extract business information from conversation history messages
+ * Enhanced to parse from Q&A messages when structured format isn't available
+ */
+const extractBusinessInfoFromHistory = (messages: Message[]) => {
+  console.log(`🔍 Scanning ${messages.length} history messages for business info`);
+  
+  // First try to find structured business_info tags (preferred method)
+  for (const message of messages) {
+    if (message.type === 'text' && message.role === 'assistant') {
+      const content = message.content;
+      if (typeof content === 'string' && content.includes('<business_info>')) {
+        console.log(`📋 Found business_info tags in message`);
+        
+        const businessInfoMatch = content.match(
+          /<business_info>([\s\S]*?)<\/business_info>/
+        );
+        
+        if (businessInfoMatch) {
+          try {
+            const businessInfoText = businessInfoMatch[1];
+            const parsedBusinessInfo = JSON.parse(businessInfoText);
+            
+            console.log(`✅ Successfully parsed business info from history:`, parsedBusinessInfo);
+            return parsedBusinessInfo;
+          } catch (error) {
+            console.warn(`⚠️ Could not parse business info JSON:`, error);
+          }
+        }
+      }
+    }
+  }
+  
+  console.log(`📭 No structured business_info found, trying Q&A parsing...`);
+  
+  // Fallback: Extract business info from Q&A conversation
+  const businessInfo: Partial<AgentState['businessInfo']> = {};
+  
+  for (let i = 0; i < messages.length - 1; i++) {
+    const question = messages[i];
+    const answer = messages[i + 1];
+    
+    if (question.type === 'text' && question.role === 'assistant' && 
+        answer.type === 'text' && answer.role === 'user') {
+      
+      const questionContent = typeof question.content === 'string' ? question.content.toLowerCase() : '';
+      const answerContent = typeof answer.content === 'string' ? answer.content : '';
+      
+      // Extract business name
+      if (questionContent.includes('name') && questionContent.includes('business')) {
+        businessInfo.businessName = answerContent;
+        console.log(`📋 Extracted business name: ${answerContent}`);
+      }
+      
+      // Extract business description
+      if (questionContent.includes('tell me') && questionContent.includes('do')) {
+        businessInfo.businessDescription = answerContent;
+        console.log(`📋 Extracted business description: ${answerContent}`);
+      }
+      
+      // Extract industry info
+      if (questionContent.includes('industry')) {
+        // Parse "gaming and sub-industry is mobile games" format
+        if (answerContent.toLowerCase().includes('industry') && answerContent.toLowerCase().includes('sub-industry')) {
+          const industryMatch = answerContent.match(/industry is (\w+)/i);
+          const subIndustryMatch = answerContent.match(/sub-industry is ([^.]+)/i);
+          
+          if (industryMatch) {
+            businessInfo.businessIndustry = industryMatch[1];
+            console.log(`📋 Extracted industry: ${industryMatch[1]}`);
+          }
+          if (subIndustryMatch) {
+            businessInfo.businessSubIndustry = subIndustryMatch[1].trim();
+            console.log(`📋 Extracted sub-industry: ${subIndustryMatch[1].trim()}`);
+          }
+        }
+      }
+      
+      // Extract address
+      if (questionContent.includes('address')) {
+        businessInfo.businessAddress = answerContent;
+        console.log(`📋 Extracted address: ${answerContent}`);
+      }
+      
+      // Extract contact info
+      if (questionContent.includes('contact')) {
+        businessInfo.businessContactInfo = answerContent;
+        console.log(`📋 Extracted contact: ${answerContent}`);
+      }
+    }
+  }
+  
+  // Check if we extracted meaningful business info
+  const hasBusinessInfo = businessInfo.businessName || businessInfo.businessDescription;
+  
+  if (hasBusinessInfo) {
+    console.log(`✅ Successfully extracted business info from Q&A:`, businessInfo);
+    return businessInfo;
+  }
+  
+  console.log(`📭 No business info found in conversation history`);
+  return null;
+};
 
-// Removed unused extractBusinessInfoFromHistory function - using router-intelligence.ts instead
+/**
+ * Phase 2: Routing Decision Logic
+ * Determine which agent to route to based on project state
+ */
+const determineRouting = (projectState: any) => {
+  // If project is in NEW phase and we don't have business info
+  if (projectState.phase === 'NEW' || !projectState.businessInfo.isComplete) {
+    return {
+      agent: 'business-info-gatherer',
+      reasoning: `Project phase: ${projectState.phase}, Business info complete: ${projectState.businessInfo.isComplete}`
+    };
+  }
 
-// Removed complex routing logic in favor of simple deterministic router
+  // If we have business info and this is a change request, go straight to code agent
+  if (projectState.businessInfo.isComplete && 
+      (projectState.isChangeRequest || projectState.hasGeneratedCode)) {
+    return {
+      agent: 'code-agent',
+      reasoning: `Business info complete, Change request: ${projectState.isChangeRequest}, Has code: ${projectState.hasGeneratedCode}`
+    };
+  }
+
+  // If we have business info but no code yet, generate initial code
+  if (projectState.businessInfo.isComplete && !projectState.hasGeneratedCode) {
+    return {
+      agent: 'code-agent',
+      reasoning: `Business info complete, ready for initial code generation`
+    };
+  }
+
+  // Default fallback to business info gatherer
+  return {
+    agent: 'business-info-gatherer',
+    reasoning: `Fallback routing - unclear project state`
+  };
+};
 
 /**
  * Phase 3: Enhanced AgentState Interface
@@ -262,44 +398,27 @@ export const askUserQuestionTool = createTool({
 export const codeAgentFunction = inngest.createFunction(
   { 
     id: "code-agent",
-    concurrency: [
-      {
-        // Global concurrency - only 1 code agent can run at any time
-        limit: 1
-      },
-      {
-        // Per-project concurrency - prevent multiple runs for same project
-        key: "event.data.projectId",
-        limit: 1
-      }
-    ],
-    // Much longer debounce to prevent rapid duplicate calls
-    debounce: {
-      key: "event.data.projectId", 
-      period: "30s"
+    concurrency: {
+      // Prevent multiple runs for the same project
+      key: "event.data.projectId",
+      limit: 1
     }
   },
   { event: "code-agent/run" },
   async ({ event, step }) => {
-    const projectId = event.data.projectId;
-    
-    console.log(`🚀 CODE-AGENT: Starting execution for project ${projectId}`);
+    console.log(`🚀 CODE-AGENT: Starting execution for project ${event.data.projectId}`);
     console.log(`📝 CODE-AGENT: User input: "${event.data.value}"`);
     
-    // Check in-memory lock first
-    if (executionLocks.has(projectId)) {
-      console.log(`🚫 CODE-AGENT: Execution already in progress for project ${projectId}, aborting`);
-      throw new Error(`Execution already in progress for project ${projectId}`);
-    }
+    // Set global context for router access
+    currentUserInput = event.data.value;
+    currentProjectId = event.data.projectId;
     
-    // Acquire lock
-    executionLocks.add(projectId);
-    console.log(`🔒 CODE-AGENT: Acquired execution lock for project ${projectId}`);
-    
-    try {
-      // Set global context for router access
-      currentUserInput = event.data.value;
-    const sandboxId = await step.run("get-sandbox-id-v2", async () => {
+    // Check if there's already a running agent for this project
+    await step.run("check-concurrent-runs", async () => {
+      console.log(`🔒 CODE-AGENT: Concurrency control active for project ${event.data.projectId}`);
+      return { projectId: event.data.projectId, timestamp: new Date().toISOString() };
+    });
+    const sandboxId = await step.run("get-sandbox-id", async () => {
       const sandbox = await Sandbox.create("intuivox-nextjs-test-2");
       await sandbox.setTimeout(SANDBOX_TIMEOUT); // Keep sandbox alive for 30 mins
       return sandbox.sandboxId;
@@ -308,7 +427,7 @@ export const codeAgentFunction = inngest.createFunction(
     // Load previous messages only if history is disabled
     // When history is enabled, this will be handled automatically by the history adapter
     const previousMessages = await step.run(
-      "get-previous-messages-v2",
+      "get-previous-messages",
       async () => {
         if (ENABLE_HISTORY) {
           console.log("📚 History enabled - previous messages will be loaded by history adapter");
@@ -341,32 +460,23 @@ export const codeAgentFunction = inngest.createFunction(
     );
 
     // Phase 3: Load enhanced project context
-    const projectContext = await step.run("load-project-context", async () => {
-      console.log("📚 Loading enhanced project context...");
-      return await loadProjectContext(event.data.projectId);
-    });
-    
+    console.log("📚 Loading enhanced project context...");
+    const projectContext = await loadProjectContext(event.data.projectId);
     const changeContext = analyzeChangeRequest(event.data.value);
     
     // Phase 4: Integrate memory layer (optional)
-    const { enhancedContext } = await step.run("integrate-memory-layer", async () => {
-      console.log("🧠 Integrating memory layer...");
-      const result = await integrateMemoryLayer(
-        event.data.projectId,
-        event.data.value,
-        projectContext
-      );
-      
-      if (result.suggestions.length > 0) {
-        console.log("💡 Memory suggestions available:", result.suggestions);
-      }
-      
-      return result;
-    });
+    console.log("🧠 Integrating memory layer...");
+    const { suggestions, enhancedContext } = await integrateMemoryLayer(
+      event.data.projectId,
+      event.data.value,
+      projectContext
+    );
+    
+    if (suggestions.length > 0) {
+      console.log("💡 Memory suggestions available:", suggestions);
+    }
     
     // Create initial state with enhanced context
-    console.log("🔍 STATE-INIT: Enhanced context business info:", enhancedContext.businessInfo);
-    
     const state = createState<AgentState>(
       {
         // Core project info
@@ -418,7 +528,7 @@ export const codeAgentFunction = inngest.createFunction(
       conversationTurn: state.data.conversationTurn,
       hasFiles: Object.keys(state.data.files).length > 0,
       hasBusinessInfo: !!state.data.businessInfo.businessName,
-      changeRequestType: changeContext?.type || null
+      changeRequestType: changeContext?.type
     });
 
     const businessInfoGathererAgent = createAgent<AgentState>({
@@ -490,7 +600,7 @@ export const codeAgentFunction = inngest.createFunction(
             command: z.string(),
           }),
           handler: async ({ command }, { step, network }) => {
-            return await step?.run("terminal-command", async () => {
+            return await step?.run("terminal", async () => {
               const buffers = { stdout: "", stderr: "" };
 
               try {
@@ -548,7 +658,7 @@ export const codeAgentFunction = inngest.createFunction(
              */
 
             const newFiles = await step?.run(
-              "create-update-files",
+              "createOrUpdateFiles",
               async () => {
                 try {
                   const updatedFiles = network.state.data.files || {};
@@ -587,7 +697,7 @@ export const codeAgentFunction = inngest.createFunction(
             files: z.array(z.string()),
           }),
           handler: async ({ files }, { step, network }) => {
-            return await step?.run("read-files-operation", async () => {
+            return await step?.run("readFiles", async () => {
               try {
                 const currentSandboxId = network.state.data.sandboxId;
                 const currentFiles = network.state.data.files || {};
@@ -658,32 +768,42 @@ export const codeAgentFunction = inngest.createFunction(
           return; // Stop the network when we have a summary
         }
 
-        const businessInfo = network.state.data.businessInfo;
+        // PHASE 2: Router Intelligence - Get comprehensive project state
+        const projectId = network.state.data.projectId;
+        const userInput = currentUserInput; // Use global context
         
-        // Enhanced completion check - require name and description, log current state
-        console.log(`🔍 ROUTER: Current business info state:`, {
-          businessName: businessInfo.businessName,
-          businessDescription: businessInfo.businessDescription,
-          businessIndustry: businessInfo.businessIndustry,
-          businessSubIndustry: businessInfo.businessSubIndustry,
-          businessAddress: businessInfo.businessAddress,
-          businessContactInfo: businessInfo.businessContactInfo
-        });
+        console.log("🧠 ROUTER: Using Phase 2 Router Intelligence");
+        console.log(`📝 ROUTER: Analyzing user input: "${userInput}"`);
+        const projectState = await getProjectState(projectId, userInput);
         
-        const isBusinessInfoComplete = !!(
-          businessInfo.businessName && 
-          businessInfo.businessDescription
-        );
-
-        console.log(`🧭 ROUTER: Business info complete: ${isBusinessInfoComplete}`);
-
-        if (!isBusinessInfoComplete) {
-          console.log("➡️ ROUTER: Routing to business-info-gatherer-agent");
-          return businessInfoGathererAgent;
+        // Update network state with discovered business info
+        if (projectState.businessInfo.isComplete && 
+            (!network.state.data.businessInfo.businessName)) {
+          console.log("🔄 ROUTER: Updating network state with discovered business info");
+          
+          network.state.data.businessInfo = {
+            businessName: projectState.businessInfo.businessName || "",
+            businessDescription: projectState.businessInfo.businessDescription || "",
+            businessIndustry: projectState.businessInfo.businessIndustry || "",
+            businessSubIndustry: projectState.businessInfo.businessSubIndustry || "",
+            businessAddress: projectState.businessInfo.businessAddress || "",
+            businessContactInfo: projectState.businessInfo.businessContactInfo || "",
+          };
         }
 
-        console.log("➡️ ROUTER: Routing to code-agent");
-        return codeAgent;
+        // Router decision based on project state
+        const routingDecision = determineRouting(projectState);
+        
+        console.log(`🧭 ROUTER: Final decision - Route to: ${routingDecision.agent}`);
+        console.log(`📊 ROUTER: Decision reasoning:`, routingDecision.reasoning);
+
+        if (routingDecision.agent === 'business-info-gatherer') {
+          console.log("➡️ ROUTER: Routing to business-info-gatherer-agent");
+          return businessInfoGathererAgent;
+        } else {
+          console.log("➡️ ROUTER: Routing to code-agent");
+          return codeAgent;
+        }
       },
       // Add history adapter if enabled
       ...(ENABLE_HISTORY && {
@@ -761,7 +881,7 @@ export const codeAgentFunction = inngest.createFunction(
       !result.state.data.summary ||
       Object.keys(result.state.data.files || {}).length === 0;
 
-    const sandboxUrl = await step.run("get-sandbox-url-v2", async () => {
+    const sandboxUrl = await step.run("get-sandbox-url", async () => {
       const currentSandboxId = result.state.data.sandboxId;
       const currentFiles = result.state.data.files || {};
 
@@ -781,7 +901,7 @@ export const codeAgentFunction = inngest.createFunction(
       };
     });
 
-    await step.run("save-result-v2", async () => {
+    await step.run("save-result", async () => {
       if (isError) {
         return await prisma.message.create({
           data: {
@@ -810,18 +930,12 @@ export const codeAgentFunction = inngest.createFunction(
       });
     });
 
-      return {
-        url: sandboxUrl.url,
-        title: "Fragment",
-        files: result.state.data.files,
-        summary: result.state.data.summary,
-      };
-      
-    } finally {
-      // Always release lock
-      executionLocks.delete(projectId);
-      console.log(`🔓 CODE-AGENT: Released execution lock for project ${projectId}`);
-    }
+    return {
+      url: sandboxUrl.url,
+      title: "Fragment",
+      files: result.state.data.files,
+      summary: result.state.data.summary,
+    };
   }
 );
 
